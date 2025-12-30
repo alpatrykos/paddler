@@ -1,5 +1,7 @@
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
@@ -114,11 +116,14 @@ fn input_value_to_messages(input: Value) -> Result<Vec<ConversationMessage>, Err
                         .unwrap_or("user")
                         .to_string();
                     let content = match item_type {
-                        "input_text" => object
+                        "input_text" => match object
                             .get("text")
                             .and_then(Value::as_str)
                             .map(|value| value.to_string())
-                            .ok_or_else(|| anyhow!("Missing input text"))?,
+                        {
+                            Some(text) => text,
+                            None => return Some(Err(anyhow!("Missing input text"))),
+                        },
                         "message" => {
                             let content_value = object
                                 .get("content")
@@ -207,11 +212,12 @@ fn input_value_to_messages(input: Value) -> Result<Vec<ConversationMessage>, Err
     }
 }
 
-fn build_response_json(
+fn build_response_json_with_status(
     response_id: &str,
     model: &str,
     output_text: &str,
     item_id: &str,
+    status: &str,
     max_output_tokens: Option<i32>,
     store: Option<bool>,
     temperature: Option<f64>,
@@ -228,7 +234,7 @@ fn build_response_json(
         "object": "response",
         "created_at": current_timestamp(),
         "model": model,
-        "status": "completed",
+        "status": status,
         "error": null,
         "incomplete_details": null,
         "instructions": null,
@@ -237,7 +243,7 @@ fn build_response_json(
             {
                 "id": item_id,
                 "type": "message",
-                "status": "completed",
+                "status": status,
                 "role": "assistant",
                 "content": [
                     {
@@ -262,7 +268,7 @@ fn build_response_json(
             }
         },
         "tool_choice": tool_choice.cloned().unwrap_or_else(|| json!("auto")),
-        "tools": tools.cloned().unwrap_or_default(),
+        "tools": tools.map(|t| t.to_vec()).unwrap_or_default(),
         "top_p": top_p.unwrap_or(1.0),
         "truncation": truncation.unwrap_or("disabled"),
         "user": user,
@@ -281,12 +287,82 @@ fn build_response_json(
     })
 }
 
+fn build_response_json(
+    response_id: &str,
+    model: &str,
+    output_text: &str,
+    item_id: &str,
+    max_output_tokens: Option<i32>,
+    store: Option<bool>,
+    temperature: Option<f64>,
+    top_p: Option<f64>,
+    parallel_tool_calls: Option<bool>,
+    truncation: Option<&str>,
+    tool_choice: Option<&Value>,
+    tools: Option<&[Value]>,
+    metadata: Option<&Value>,
+    user: Option<&str>,
+) -> serde_json::Value {
+    build_response_json_with_status(
+        response_id,
+        model,
+        output_text,
+        item_id,
+        "completed",
+        max_output_tokens,
+        store,
+        temperature,
+        top_p,
+        parallel_tool_calls,
+        truncation,
+        tool_choice,
+        tools,
+        metadata,
+        user,
+    )
+}
+
+fn build_response_created_json(
+    response_id: &str,
+    model: &str,
+    item_id: &str,
+    max_output_tokens: Option<i32>,
+    store: Option<bool>,
+    temperature: Option<f64>,
+    top_p: Option<f64>,
+    parallel_tool_calls: Option<bool>,
+    truncation: Option<&str>,
+    tool_choice: Option<&Value>,
+    tools: Option<&[Value]>,
+    metadata: Option<&Value>,
+    user: Option<&str>,
+) -> serde_json::Value {
+    build_response_json_with_status(
+        response_id,
+        model,
+        "",
+        item_id,
+        "in_progress",
+        max_output_tokens,
+        store,
+        temperature,
+        top_p,
+        parallel_tool_calls,
+        truncation,
+        tool_choice,
+        tools,
+        metadata,
+        user,
+    )
+}
+
 #[derive(Clone)]
 struct OpenAIResponsesStreamingResponseTransformer {
     model: String,
     response_id: String,
     item_id: String,
     output_text: Arc<Mutex<String>>,
+    response_created_sent: Arc<AtomicBool>,
     max_output_tokens: Option<i32>,
     store: Option<bool>,
     temperature: Option<f64>,
@@ -301,12 +377,45 @@ struct OpenAIResponsesStreamingResponseTransformer {
 
 #[async_trait]
 impl TransformsOutgoingMessage for OpenAIResponsesStreamingResponseTransformer {
-    type TransformedMessage = serde_json::Value;
+    type TransformedMessage = String;
+
+    fn stringify(&self, message: &Self::TransformedMessage) -> anyhow::Result<String> {
+        Ok(message.clone())
+    }
 
     async fn transform(
         &self,
         message: OutgoingMessage,
     ) -> anyhow::Result<Self::TransformedMessage> {
+        let emit_created = || {
+            let response = build_response_created_json(
+                &self.response_id,
+                &self.model,
+                &self.item_id,
+                self.max_output_tokens,
+                self.store,
+                self.temperature,
+                self.top_p,
+                self.parallel_tool_calls,
+                self.truncation.as_deref(),
+                self.tool_choice.as_ref(),
+                self.tools.as_deref(),
+                self.metadata.as_ref(),
+                self.user.as_deref(),
+            );
+            Ok::<_, anyhow::Error>(format!(
+                "data: {}\n\n",
+                serde_json::to_string(&json!({
+                    "type": "response.created",
+                    "response": response
+                }))?
+            ))
+        };
+
+        let emit_event = |value: serde_json::Value| -> anyhow::Result<String> {
+            Ok(format!("data: {}\n\n", serde_json::to_string(&value)?))
+        };
+
         match message {
             OutgoingMessage::Response(ResponseEnvelope {
                 response: OutgoingResponse::GeneratedToken(GeneratedTokenResult::Done),
@@ -317,8 +426,7 @@ impl TransformsOutgoingMessage for OpenAIResponsesStreamingResponseTransformer {
                     .lock()
                     .expect("Failed to lock output text")
                     .clone();
-
-                Ok(json!({
+                let completed = emit_event(json!({
                     "type": "response.completed",
                     "response": build_response_json(
                         &self.response_id,
@@ -336,7 +444,15 @@ impl TransformsOutgoingMessage for OpenAIResponsesStreamingResponseTransformer {
                         self.metadata.as_ref(),
                         self.user.as_deref(),
                     )
-                }))
+                }))?;
+
+                let created_already_sent =
+                    self.response_created_sent.swap(true, Ordering::SeqCst);
+                if created_already_sent {
+                    Ok(completed)
+                } else {
+                    Ok(format!("{}{}", emit_created()?, completed))
+                }
             }
             OutgoingMessage::Response(ResponseEnvelope {
                 response: OutgoingResponse::GeneratedToken(GeneratedTokenResult::Token(token)),
@@ -344,17 +460,24 @@ impl TransformsOutgoingMessage for OpenAIResponsesStreamingResponseTransformer {
             }) => {
                 let mut output_text = self.output_text.lock().expect("Failed to lock output text");
                 output_text.push_str(&token);
-
-                Ok(json!({
+                let delta = emit_event(json!({
                     "type": "response.output_text.delta",
                     "response_id": self.response_id,
                     "output_index": 0,
                     "content_index": 0,
                     "item_id": self.item_id,
                     "delta": token
-                }))
+                }))?;
+
+                let created_already_sent =
+                    self.response_created_sent.swap(true, Ordering::SeqCst);
+                if created_already_sent {
+                    Ok(delta)
+                } else {
+                    Ok(format!("{}{}", emit_created()?, delta))
+                }
             }
-            _ => Ok(serde_json::to_value(&message)?),
+            _ => emit_event(serde_json::to_value(&message)?),
         }
     }
 }
@@ -413,6 +536,7 @@ async fn respond(
                 response_id: nanoid!(),
                 item_id: nanoid!(),
                 output_text: Arc::new(Mutex::new(String::new())),
+                response_created_sent: Arc::new(AtomicBool::new(false)),
                 max_output_tokens: openai_params.max_output_tokens,
                 store: openai_params.store,
                 temperature: openai_params.temperature,
