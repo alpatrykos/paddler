@@ -50,6 +50,7 @@ impl Service for OpenAIService {
                 .app_data(app_data.clone())
                 .configure(common_http_route::get_health::register)
                 .configure(http_route::post_chat_completions::register)
+                .configure(http_route::post_responses::register)
         })
         .shutdown_signal(async move {
             if let Err(err) = shutdown.recv().await {
